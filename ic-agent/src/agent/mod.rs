@@ -1145,6 +1145,7 @@ impl Agent {
 
     /// Returns an `UpdateBuilder` enabling the construction of an update call without
     /// passing all arguments.
+    #[allow(mismatched_lifetime_syntaxes)]
     pub fn update<S: Into<String>>(
         &self,
         canister_id: &Principal,
@@ -1166,6 +1167,7 @@ impl Agent {
 
     /// Returns a `QueryBuilder` enabling the construction of a query call without
     /// passing all arguments.
+    #[allow(mismatched_lifetime_syntaxes)]
     pub fn query<S: Into<String>>(&self, canister_id: &Principal, method_name: S) -> QueryBuilder {
         QueryBuilder::new(self, *canister_id, method_name.into())
     }

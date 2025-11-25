@@ -57,6 +57,7 @@ pub trait NonceGenerator: Send + Sync {
     fn generate(&self) -> Option<Vec<u8>>;
 }
 
+#[allow(dead_code)]
 pub struct Func<T>(pub T);
 impl<T: Send + Sync + Fn() -> Option<Vec<u8>>> NonceGenerator for Func<T> {
     fn generate(&self) -> Option<Vec<u8>> {

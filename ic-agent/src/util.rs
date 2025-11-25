@@ -3,6 +3,7 @@
 use std::future::Future;
 use std::time::Duration;
 
+#[allow(unused_variables)]
 pub async fn sleep(d: Duration) {
     #[cfg(not(all(target_family = "wasm", feature = "wasm-bindgen")))]
     tokio::time::sleep(d).await;
