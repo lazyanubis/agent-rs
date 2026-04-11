@@ -9,7 +9,7 @@ use p256::{
     SecretKey,
 };
 #[cfg(feature = "pem")]
-use std::{fs::File, io, path::Path};
+use std::path::Path;
 
 use super::Delegation;
 
@@ -27,18 +27,21 @@ impl Prime256v1Identity {
     /// Creates an identity from a PEM file. Shorthand for calling `from_pem` with `std::fs::read`.
     #[cfg(feature = "pem")]
     pub fn from_pem_file<P: AsRef<Path>>(file_path: P) -> Result<Self, PemError> {
-        Self::from_pem(File::open(file_path)?)
+        Self::from_pem(std::fs::read(file_path)?)
     }
 
-    /// Creates an identity from a PEM certificate.
+    /// Creates an identity from a PEM-encoded private key (SEC1 or PKCS#8).
+    ///
+    /// Accepts keys in SEC1 ("EC PRIVATE KEY") or PKCS#8 ("PRIVATE KEY") format.
     #[cfg(feature = "pem")]
-    pub fn from_pem<R: io::Read>(pem_reader: R) -> Result<Self, PemError> {
+    pub fn from_pem<B: AsRef<[u8]>>(pem_contents: B) -> Result<Self, PemError> {
+        use pkcs8::{AssociatedOid, PrivateKeyInfo};
         use sec1::{pem::PemLabel, EcPrivateKey};
 
         const EC_PARAMETERS: &str = "EC PARAMETERS";
         const PRIME256V1: &[u8] = b"\x06\x08\x2a\x86\x48\xce\x3d\x03\x01\x07";
 
-        let contents = pem_reader.bytes().collect::<Result<Vec<u8>, io::Error>>()?;
+        let contents = pem_contents.as_ref();
 
         for pem in pem::parse_many(contents)? {
             if pem.tag() == EC_PARAMETERS && pem.contents() != PRIME256V1 {
@@ -48,12 +51,24 @@ impl Prime256v1Identity {
                 ));
             }
 
-            if pem.tag() != EcPrivateKey::PEM_LABEL {
-                continue;
+            if pem.tag() == EcPrivateKey::PEM_LABEL {
+                // SEC1 "EC PRIVATE KEY" format
+                let private_key = SecretKey::from_sec1_der(pem.contents())
+                    .map_err(|_| pkcs8::Error::KeyMalformed)?;
+                return Ok(Self::from_private_key(private_key));
             }
-            let private_key =
-                SecretKey::from_sec1_der(pem.contents()).map_err(|_| pkcs8::Error::KeyMalformed)?;
-            return Ok(Self::from_private_key(private_key));
+
+            if pem.tag() == PrivateKeyInfo::PEM_LABEL {
+                // PKCS#8 "PRIVATE KEY" format
+                let key_bytes = super::parse_ec_pkcs8_key_bytes(
+                    pem.contents(),
+                    p256::NistP256::OID,
+                    "prime256v1",
+                )?;
+                let private_key =
+                    SecretKey::from_sec1_der(&key_bytes).map_err(|_| pkcs8::Error::KeyMalformed)?;
+                return Ok(Self::from_private_key(private_key));
+            }
         }
         Err(pem::PemError::MissingData.into())
     }
@@ -122,7 +137,7 @@ mod test {
     use p256::{
         ecdsa::{signature::Verifier, Signature},
         elliptic_curve::PrimeField,
-        FieldBytes, Scalar,
+        Scalar,
     };
 
     // WRONG_CURVE_IDENTITY_FILE is generated from the following command:
@@ -178,6 +193,16 @@ Sks4xGbA/ZbazsrMl4v446U5UIVxCGGaKw==
         Prime256v1Identity::from_pem(WRONG_CURVE_IDENTITY_FILE_NO_PARAMS.as_bytes()).unwrap();
     }
 
+    // IDENTITY_FILE_PKCS8 is the same key as IDENTITY_FILE, converted to PKCS#8:
+    // > openssl pkcs8 -topk8 -nocrypt -in identity.pem -out identity_pkcs8.pem
+    const IDENTITY_FILE_PKCS8: &str = "\
+-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgvXJuZvDH64piyxw5
+ly/vUyYqGs2p88/SR7W6cRPkBjihRANCAARRttlXg16tlM9Z9tDvj38Y0u7xNofw
+FRL8jv/6Kmy74w/LB+cEUhlKSzjEZsD9ltrOysyXi/jjpTlQhXEIYZor
+-----END PRIVATE KEY-----
+";
+
     #[test]
     fn test_prime256v1_public_key() {
         // Create a prime256v1 identity from a PEM file.
@@ -186,6 +211,30 @@ Sks4xGbA/ZbazsrMl4v446U5UIVxCGGaKw==
 
         // Assert the DER-encoded prime256v1 public key matches what we would expect.
         assert!(DER_ENCODED_PUBLIC_KEY == hex::encode(identity.der_encoded_public_key));
+    }
+
+    #[test]
+    fn test_prime256v1_pkcs8_public_key() {
+        let identity = Prime256v1Identity::from_pem(IDENTITY_FILE_PKCS8.as_bytes())
+            .expect("Cannot create prime256v1 identity from PKCS#8 PEM file.");
+        assert_eq!(
+            DER_ENCODED_PUBLIC_KEY,
+            hex::encode(identity.der_encoded_public_key)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "UnsupportedKeyCurve")]
+    fn test_prime256v1_pkcs8_reject_wrong_curve() {
+        // A PKCS#8 secp256k1 key must be rejected by Prime256v1Identity.
+        const SECP256K1_PKCS8: &str = "\
+-----BEGIN PRIVATE KEY-----
+MIGEAgEAMBAGByqGSM49AgEGBSuBBAAKBG0wawIBAQQgCDLudkRxUeRDhnUp2pvL
+xLDICLIoNCa1sQdMgz5Y14GhRANCAASA7zusnWjPN0y8nJlD4YAEOpTEYu+CcCdO
+VwidXc26G4+/g7dUbMwbN4E3d3bpxHEP31M+2by6jY67MqFKKroR
+-----END PRIVATE KEY-----
+";
+        Prime256v1Identity::from_pem(SECP256K1_PKCS8.as_bytes()).unwrap();
     }
 
     #[test]
@@ -210,12 +259,18 @@ Sks4xGbA/ZbazsrMl4v446U5UIVxCGGaKw==
             .expect("Cannot find prime256v1 signature bytes.");
 
         // Import the prime256v1 signature.
-        let r: Scalar = Option::from(Scalar::from_repr(*FieldBytes::from_slice(
-            &signature[0..32],
-        )))
+        let r: Scalar = Option::from(Scalar::from_repr(
+            <[u8; 32]>::try_from(&signature[0..32])
+                .expect("Cannot extract r component from prime256v1 signature bytes.")
+                .into(),
+        ))
         .expect("Cannot extract r component from prime256v1 signature bytes.");
-        let s: Scalar = Option::from(Scalar::from_repr(*FieldBytes::from_slice(&signature[32..])))
-            .expect("Cannot extract s component from prime256v1 signature bytes.");
+        let s: Scalar = Option::from(Scalar::from_repr(
+            <[u8; 32]>::try_from(&signature[32..])
+                .expect("Cannot extract s component from prime256v1 signature bytes.")
+                .into(),
+        ))
+        .expect("Cannot extract s component from prime256v1 signature bytes.");
         let ecdsa_sig = Signature::from_scalars(r, s)
             .expect("Cannot create prime256v1 signature from r and s components.");
 

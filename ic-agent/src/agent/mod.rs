@@ -10,6 +10,7 @@ pub(crate) mod nonce;
 pub(crate) mod response_authentication;
 pub mod route_provider;
 pub mod status;
+pub mod subnet;
 
 pub use agent_config::AgentConfig;
 pub use agent_error::AgentError;
@@ -27,15 +28,13 @@ pub use ic_transport_types::{
     RequestStatusResponse,
 };
 pub use nonce::{NonceFactory, NonceGenerator};
-use rangemap::{RangeInclusiveMap, RangeInclusiveSet, StepFns};
+use rangemap::RangeInclusiveMap;
 use reqwest::{Client, Request, Response};
 use route_provider::{
-    dynamic_routing::{
-        dynamic_route_provider::DynamicRouteProviderBuilder, node::Node,
-        snapshot::latency_based_routing::LatencyRoutingSnapshot,
-    },
+    dynamic_routing::{dynamic_route_provider::DynamicRouteProviderBuilder, node::Node},
     RouteProvider, UrlUntilReady,
 };
+pub use subnet::{Subnet, SubnetType};
 use time::OffsetDateTime;
 use tower_service::Service;
 
@@ -44,8 +43,9 @@ mod agent_test;
 
 use crate::{
     agent::response_authentication::{
-        extract_der, lookup_canister_info, lookup_canister_metadata, lookup_request_status,
-        lookup_subnet, lookup_subnet_canister_ranges, lookup_subnet_metrics, lookup_time,
+        extract_der, lookup_canister_info, lookup_canister_metadata, lookup_canister_ranges,
+        lookup_incomplete_subnet, lookup_request_status, lookup_subnet_and_ranges,
+        lookup_subnet_canister_ranges, lookup_subnet_metrics, lookup_time, lookup_tree,
         lookup_value,
     },
     agent_error::TransportError,
@@ -64,7 +64,6 @@ use serde::Serialize;
 use status::Status;
 use std::{
     borrow::Cow,
-    collections::HashMap,
     convert::TryFrom,
     fmt::{self, Debug},
     future::{Future, IntoFuture},
@@ -89,9 +88,8 @@ type AgentFuture<'a, V> = Pin<Box<dyn Future<Output = Result<V, AgentError>> + '
 
 /// A low level Agent to make calls to a Replica endpoint.
 ///
-/// ```ignore
-/// # // This test is ignored because it requires an ic to be running. We run these
-/// # // in the ic-ref workflow.
+#[cfg_attr(unix, doc = " ```rust")] // pocket-ic
+#[cfg_attr(not(unix), doc = " ```ignore")]
 /// use ic_agent::{Agent, export::Principal};
 /// use candid::{Encode, Decode, CandidType, Nat};
 /// use serde::Deserialize;
@@ -112,7 +110,8 @@ type AgentFuture<'a, V> = Pin<Box<dyn Future<Output = Result<V, AgentError>> + '
 /// # }
 /// #
 /// async fn create_a_canister() -> Result<Principal, Box<dyn std::error::Error>> {
-/// # let url = format!("http://localhost:{}", option_env!("IC_REF_PORT").unwrap_or("4943"));
+/// # Ok(ref_tests::utils::with_pic(async move |pic| {
+/// # let url = ref_tests::utils::get_pic_url(&pic);
 ///   let agent = Agent::builder()
 ///     .with_url(url)
 ///     .with_identity(create_identity())
@@ -125,10 +124,10 @@ type AgentFuture<'a, V> = Pin<Box<dyn Future<Output = Result<V, AgentError>> + '
 ///   agent.fetch_root_key().await?;
 ///   let management_canister_id = Principal::from_text("aaaaa-aa")?;
 ///
-///   // Create a call to the management canister to create a new canister ID,
-///   // and wait for a result.
-///   // The effective canister id must belong to the canister ranges of the subnet at which the canister is created.
-///   let effective_canister_id = Principal::from_text("rwlgt-iiaaa-aaaaa-aaaaa-cai").unwrap();
+///   // Create a call to the management canister to create a new canister ID, and wait for a result.
+///   // This API only works in local instances; mainnet instances must use the cycles ledger.
+///   // See `dfx info default-effective-canister-id`.
+/// # let effective_canister_id = ref_tests::utils::get_effective_canister_id(&pic).await;
 ///   let response = agent.update(&management_canister_id, "provisional_create_canister_with_cycles")
 ///     .with_effective_canister_id(effective_canister_id)
 ///     .with_arg(Encode!(&Argument { amount: None })?)
@@ -137,6 +136,7 @@ type AgentFuture<'a, V> = Pin<Box<dyn Future<Output = Result<V, AgentError>> + '
 ///   let result = Decode!(response.as_slice(), CreateCanisterResult)?;
 ///   let canister_id: Principal = Principal::from_text(&result.canister_id.to_text())?;
 ///   Ok(canister_id)
+/// # }).await)
 /// }
 ///
 /// # let mut runtime = tokio::runtime::Runtime::new().unwrap();
@@ -218,13 +218,10 @@ impl Agent {
                     );
                     let seeds = vec![Node::new(url.domain().unwrap()).unwrap()];
                     UrlUntilReady::new(url, async move {
-                        DynamicRouteProviderBuilder::new(
-                            LatencyRoutingSnapshot::new(),
-                            seeds,
-                            client,
-                        )
-                        .build()
-                        .await
+                        let provider =
+                            DynamicRouteProviderBuilder::new(seeds, client, None).build();
+                        provider.start().await;
+                        provider
                     }) as Arc<dyn RouteProvider>
                 } else {
                     Arc::new(url)
@@ -321,7 +318,7 @@ impl Agent {
         let bytes = self
             .execute(
                 Method::POST,
-                &format!("api/v2/canister/{}/query", effective_canister_id.to_text()),
+                &format!("api/v3/canister/{}/query", effective_canister_id.to_text()),
                 Some(serialized_bytes),
             )
             .await?
@@ -339,7 +336,7 @@ impl Agent {
     {
         let _permit = self.concurrent_requests_semaphore.acquire().await;
         let endpoint = format!(
-            "api/v2/canister/{}/read_state",
+            "api/v3/canister/{}/read_state",
             effective_canister_id.to_text()
         );
         let bytes = self
@@ -358,7 +355,7 @@ impl Agent {
         A: serde::de::DeserializeOwned,
     {
         let _permit = self.concurrent_requests_semaphore.acquire().await;
-        let endpoint = format!("api/v2/subnet/{}/read_state", subnet_id.to_text());
+        let endpoint = format!("api/v3/subnet/{}/read_state", subnet_id.to_text());
         let bytes = self
             .execute(Method::POST, &endpoint, Some(serialized_bytes))
             .await?
@@ -372,7 +369,7 @@ impl Agent {
         serialized_bytes: Vec<u8>,
     ) -> Result<TransportCallResponse, AgentError> {
         let _permit = self.concurrent_requests_semaphore.acquire().await;
-        let endpoint = format!("api/v3/canister/{}/call", effective_canister_id.to_text());
+        let endpoint = format!("api/v4/canister/{}/call", effective_canister_id.to_text());
         let (status_code, response_body) = self
             .execute(Method::POST, &endpoint, Some(serialized_bytes))
             .await?;
@@ -734,7 +731,12 @@ impl Agent {
                 )
                 .await?;
             match resp {
-                RequestStatusResponse::Unknown => {}
+                RequestStatusResponse::Unknown => {
+                    // If status is still `Unknown` after 5 minutes, the ingress message is lost.
+                    if retry_policy.get_elapsed_time() > Duration::from_secs(5 * 60) {
+                        return Err(AgentError::TimeoutWaitingForResponse());
+                    }
+                }
 
                 RequestStatusResponse::Received | RequestStatusResponse::Processing => {
                     if !request_accepted {
@@ -793,7 +795,12 @@ impl Agent {
                 .request_status_raw(request_id, effective_canister_id)
                 .await?;
             match resp {
-                RequestStatusResponse::Unknown => {}
+                RequestStatusResponse::Unknown => {
+                    // If status is still `Unknown` after 5 minutes, the ingress message is lost.
+                    if retry_policy.get_elapsed_time() > Duration::from_secs(5 * 60) {
+                        return Err(AgentError::TimeoutWaitingForResponse());
+                    }
+                }
 
                 RequestStatusResponse::Received | RequestStatusResponse::Processing => {
                     if !request_accepted {
@@ -946,10 +953,11 @@ impl Agent {
     }
 
     fn verify_cert_timestamp(&self, cert: &Certificate) -> Result<(), AgentError> {
+        // Verify that the certificate is not older than ingress expiry
+        // Certificates with timestamps in the future are allowed
         let time = lookup_time(cert)?;
         if (OffsetDateTime::now_utc()
             - OffsetDateTime::from_unix_timestamp_nanos(time.into()).unwrap())
-        .abs()
             > self.ingress_expiry
         {
             Err(AgentError::CertificateOutdated(self.ingress_expiry))
@@ -972,12 +980,30 @@ impl Agent {
                     return Err(AgentError::CertificateHasTooManyDelegations);
                 }
                 self.verify_cert(&cert, effective_canister_id)?;
-                let canister_range_lookup = [
-                    "subnet".as_bytes(),
-                    delegation.subnet_id.as_ref(),
-                    "canister_ranges".as_bytes(),
-                ];
-                let canister_range = lookup_value(&cert.tree, canister_range_lookup)?;
+                let canister_range_shards_lookup =
+                    ["canister_ranges".as_bytes(), delegation.subnet_id.as_ref()];
+                let canister_range_shards = lookup_tree(&cert.tree, canister_range_shards_lookup)?;
+                let mut shard_paths = canister_range_shards
+                    .list_paths() // /canister_ranges/<subnet_id>/<shard>
+                    .into_iter()
+                    .map(|mut x| {
+                        x.pop() // flatten [label] to label
+                            .ok_or_else(AgentError::CertificateVerificationFailed)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                if shard_paths.is_empty() {
+                    return Err(AgentError::CertificateNotAuthorized());
+                }
+                shard_paths.sort_unstable();
+                let shard_division = shard_paths
+                    .partition_point(|shard| shard.as_bytes() <= effective_canister_id.as_slice());
+                if shard_division == 0 {
+                    // the certificate is not authorized to answer calls for this canister
+                    return Err(AgentError::CertificateNotAuthorized());
+                }
+                let max_potential_shard = &shard_paths[shard_division - 1];
+                let canister_range_lookup = [max_potential_shard.as_bytes()];
+                let canister_range = lookup_value(&canister_range_shards, canister_range_lookup)?;
                 let ranges: Vec<(Principal, Principal)> =
                     serde_cbor::from_slice(canister_range).map_err(AgentError::InvalidCborData)?;
                 if !principal_is_within_ranges(&effective_canister_id, &ranges[..]) {
@@ -1011,7 +1037,7 @@ impl Agent {
                 self.verify_cert_for_subnet(&cert, subnet_id)?;
                 let public_key_path = [
                     "subnet".as_bytes(),
-                    delegation.subnet_id.as_ref(),
+                    subnet_id.as_ref(),
                     "public_key".as_bytes(),
                 ];
                 let pk = lookup_value(&cert.tree, public_key_path)
@@ -1105,7 +1131,7 @@ impl Agent {
             "canister_ranges".into(),
         ]];
         let cert = self.read_subnet_state_raw(paths, subnet_id).await?;
-        lookup_subnet_canister_ranges(cert, subnet_id)
+        lookup_subnet_canister_ranges(&cert, subnet_id)
     }
 
     /// Fetches the status of a particular request by its ID.
@@ -1145,12 +1171,11 @@ impl Agent {
 
     /// Returns an `UpdateBuilder` enabling the construction of an update call without
     /// passing all arguments.
-    #[allow(mismatched_lifetime_syntaxes)]
     pub fn update<S: Into<String>>(
         &self,
         canister_id: &Principal,
         method_name: S,
-    ) -> UpdateBuilder {
+    ) -> UpdateBuilder<'_> {
         UpdateBuilder::new(self, *canister_id, method_name.into())
     }
 
@@ -1167,8 +1192,11 @@ impl Agent {
 
     /// Returns a `QueryBuilder` enabling the construction of a query call without
     /// passing all arguments.
-    #[allow(mismatched_lifetime_syntaxes)]
-    pub fn query<S: Into<String>>(&self, canister_id: &Principal, method_name: S) -> QueryBuilder {
+    pub fn query<S: Into<String>>(
+        &self,
+        canister_id: &Principal,
+        method_name: S,
+    ) -> QueryBuilder<'_> {
         QueryBuilder::new(self, *canister_id, method_name.into())
     }
 
@@ -1194,7 +1222,9 @@ impl Agent {
         })
     }
 
-    async fn get_subnet_by_canister(
+    /// Retrieve subnet information for a canister. This uses an internal five-minute cache, fresh data can
+    /// be fetched with [`fetch_subnet_by_canister`](Self::fetch_subnet_by_canister).
+    pub async fn get_subnet_by_canister(
         &self,
         canister: &Principal,
     ) -> Result<Arc<Subnet>, AgentError> {
@@ -1210,7 +1240,22 @@ impl Agent {
         }
     }
 
-    /// Retrieve all existing API boundary nodes from the state tree via endpoint `/api/v2/canister/<effective_canister_id>/read_state`
+    /// Retrieve subnet information for a subnet ID. This uses an internal five-minute cache, fresh data can
+    /// be fetched with [`fetch_subnet_by_id`](Self::fetch_subnet_by_id).
+    pub async fn get_subnet_by_id(&self, subnet_id: &Principal) -> Result<Arc<Subnet>, AgentError> {
+        let subnet = self
+            .subnet_key_cache
+            .lock()
+            .unwrap()
+            .get_subnet_by_id(subnet_id);
+        if let Some(subnet) = subnet {
+            Ok(subnet)
+        } else {
+            self.fetch_subnet_by_id(subnet_id).await
+        }
+    }
+
+    /// Retrieve all existing API boundary nodes from the state tree via endpoint `/api/v3/canister/<effective_canister_id>/read_state`
     pub async fn fetch_api_boundary_nodes_by_canister_id(
         &self,
         canister_id: Principal,
@@ -1221,7 +1266,7 @@ impl Agent {
         Ok(api_boundary_nodes)
     }
 
-    /// Retrieve all existing API boundary nodes from the state tree via endpoint `/api/v2/subnet/<subnet_id>/read_state`
+    /// Retrieve all existing API boundary nodes from the state tree via endpoint `/api/v3/subnet/<subnet_id>/read_state`
     pub async fn fetch_api_boundary_nodes_by_subnet_id(
         &self,
         subnet_id: Principal,
@@ -1232,15 +1277,32 @@ impl Agent {
         Ok(api_boundary_nodes)
     }
 
-    async fn fetch_subnet_by_canister(
+    /// Fetches and caches the subnet information for a canister.
+    ///
+    /// This function does not read from the cache; most users want
+    /// [`get_subnet_by_canister`](Self::get_subnet_by_canister) instead.
+    pub async fn fetch_subnet_by_canister(
         &self,
         canister: &Principal,
     ) -> Result<Arc<Subnet>, AgentError> {
-        let cert = self
+        let canister_cert = self
             .read_state_raw(vec![vec!["subnet".into()]], *canister)
             .await?;
-
-        let (subnet_id, subnet) = lookup_subnet(&cert, &self.root_key.read().unwrap())?;
+        let subnet_id = if let Some(delegation) = canister_cert.delegation.as_ref() {
+            Principal::from_slice(&delegation.subnet_id)
+        } else {
+            // if no delegation, it comes from the root subnet
+            Principal::self_authenticating(&self.root_key.read().unwrap()[..])
+        };
+        let mut subnet = lookup_incomplete_subnet(&subnet_id, &canister_cert)?;
+        let canister_ranges = if let Some(delegation) = canister_cert.delegation.as_ref() {
+            // non-root subnets will not serve /subnet/<>/canister_ranges when looked up by canister, but their delegation will contain /canister_ranges
+            let delegation_cert: Certificate = serde_cbor::from_slice(&delegation.certificate)?;
+            lookup_canister_ranges(&subnet_id, &delegation_cert)?
+        } else {
+            lookup_canister_ranges(&subnet_id, &canister_cert)?
+        };
+        subnet.canister_ranges = canister_ranges;
         if !subnet.canister_ranges.contains(canister) {
             return Err(AgentError::CertificateNotAuthorized());
         }
@@ -1249,6 +1311,32 @@ impl Agent {
             .lock()
             .unwrap()
             .insert_subnet(subnet_id, subnet.clone());
+        Ok(subnet)
+    }
+
+    /// Fetches and caches the subnet information for a subnet ID.
+    ///
+    /// This function does not read from the cache; most users want
+    /// [`get_subnet_by_id`](Self::get_subnet_by_id) instead.
+    pub async fn fetch_subnet_by_id(
+        &self,
+        subnet_id: &Principal,
+    ) -> Result<Arc<Subnet>, AgentError> {
+        let subnet_cert = self
+            .read_subnet_state_raw(
+                vec![
+                    vec!["canister_ranges".into(), subnet_id.as_slice().into()],
+                    vec!["subnet".into(), subnet_id.as_slice().into()],
+                ],
+                *subnet_id,
+            )
+            .await?;
+        let subnet = lookup_subnet_and_ranges(subnet_id, &subnet_cert)?;
+        let subnet = Arc::new(subnet);
+        self.subnet_key_cache
+            .lock()
+            .unwrap()
+            .insert_subnet(*subnet_id, subnet.clone());
         Ok(subnet)
     }
 
@@ -1564,14 +1652,14 @@ pub fn signed_request_status_inspect(
 #[derive(Clone)]
 struct SubnetCache {
     subnets: TimedCache<Principal, Arc<Subnet>>,
-    canister_index: RangeInclusiveMap<Principal, Principal, PrincipalStep>,
+    canister_index: RangeInclusiveMap<Principal, Principal>,
 }
 
 impl SubnetCache {
     fn new() -> Self {
         Self {
-            subnets: TimedCache::with_lifespan(300),
-            canister_index: RangeInclusiveMap::new_with_step_fns(),
+            subnets: TimedCache::with_lifespan(Duration::from_secs(300)),
+            canister_index: RangeInclusiveMap::new(),
         }
     }
 
@@ -1582,51 +1670,16 @@ impl SubnetCache {
             .filter(|subnet| subnet.canister_ranges.contains(canister))
     }
 
+    fn get_subnet_by_id(&mut self, subnet_id: &Principal) -> Option<Arc<Subnet>> {
+        self.subnets.cache_get(subnet_id).cloned()
+    }
+
     fn insert_subnet(&mut self, subnet_id: Principal, subnet: Arc<Subnet>) {
         self.subnets.cache_set(subnet_id, subnet.clone());
         for range in subnet.canister_ranges.iter() {
             self.canister_index.insert(range.clone(), subnet_id);
         }
     }
-}
-
-#[derive(Clone, Copy)]
-struct PrincipalStep;
-
-impl StepFns<Principal> for PrincipalStep {
-    fn add_one(start: &Principal) -> Principal {
-        let bytes = start.as_slice();
-        let mut arr = [0; 29];
-        arr[..bytes.len()].copy_from_slice(bytes);
-        for byte in arr[..bytes.len() - 1].iter_mut().rev() {
-            *byte = byte.wrapping_add(1);
-            if *byte != 0 {
-                break;
-            }
-        }
-        Principal::from_slice(&arr[..bytes.len()])
-    }
-    fn sub_one(start: &Principal) -> Principal {
-        let bytes = start.as_slice();
-        let mut arr = [0; 29];
-        arr[..bytes.len()].copy_from_slice(bytes);
-        for byte in arr[..bytes.len() - 1].iter_mut().rev() {
-            *byte = byte.wrapping_sub(1);
-            if *byte != 255 {
-                break;
-            }
-        }
-        Principal::from_slice(&arr[..bytes.len()])
-    }
-}
-
-#[derive(Clone)]
-pub(crate) struct Subnet {
-    // This key is just fetched for completeness. Do not actually use this value as it is not authoritative in case of a rogue subnet.
-    // If a future agent needs to know the subnet key then it should fetch /subnet from the *root* subnet.
-    _key: Vec<u8>,
-    node_keys: HashMap<Principal, Vec<u8>>,
-    canister_ranges: RangeInclusiveSet<Principal, PrincipalStep>,
 }
 
 /// API boundary node, which routes /api calls to IC replica nodes.

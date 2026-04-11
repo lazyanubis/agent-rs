@@ -8,6 +8,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## [0.47.0] - 2026-03-23
+
+* `ic-agent`: `DynamicRouteProviderBuilder::new()` and `::from_components()` now accept a `k_top_nodes: Option<usize>` parameter. Pass `Some(k)` to limit routing to the `k` nodes with the highest latency score; pass `None` to retain the existing behaviour of routing across all healthy nodes.
+
+## [0.46.2] - 2026-03-10
+
+* `Subnet`, `SubnetNodeIter`, and `SubnetKeysIter` now implement `Debug`.
+* `ic-agent`: Added `SubnetType` enum (`System`, `Application`, `VerifiedApplication`, `Unknown(String)`) and exposed it via a new `subnet_type()` accessor on `Subnet`. The field is `None` when the certificate was produced by a replica with certification version older than V25, and `Some(SubnetType)` otherwise. `SubnetType` is re-exported from `ic_agent` alongside `Subnet`.
+
+## [0.46.1] - 2026-03-05
+
+* Fix panic in `ic-agent` on non-WASM targets caused by `async-watch` crate; replaced with `tokio::sync::watch`.
+
+## [0.46.0] - 2026-03-04
+
+* Time out `Unknown` statuses after 5 minutes, regardless of the configured `max_polling_time`.
+* `ic-utils`: Bump `ic-management-canister-types` to 0.7.1.
+  * Added `LogMemoryLimit` attribute type and `with_log_memory_limit` setter to `CreateCanisterBuilder` and `UpdateSettingsBuilder`.
+  * Added `canister_metadata()` query method to `ManagementCanister`.
+  * Re-exported new types: `CanisterLogFilter`, `CanisterMetadataArgs`, `CanisterMetadataResult`, `FetchCanisterLogsArgs`, `MemoryMetrics`, `RenameCanisterRecord`, `RenameToRecord`.
+
+### Breaking Changes
+
+* `ic-utils`:
+  * `UpdateCanisterBuilder` renamed to `UpdateSettingsBuilder`.
+    * Migration: Replace all uses of `UpdateCanisterBuilder` with `UpdateSettingsBuilder`.
+  * `ManagementCanister::fetch_canister_logs` now takes `&FetchCanisterLogsArgs` instead of `&Principal`.
+    * Migration: Replace `fetch_canister_logs(&canister_id)` with `fetch_canister_logs(&FetchCanisterLogsArgs { canister_id, filter: None })`.
+  * Snapshot methods (`take_canister_snapshot`, `load_canister_snapshot`, `delete_canister_snapshot`, `read_canister_snapshot_metadata`, `read_canister_snapshot_data`, `upload_canister_snapshot_metadata`, `upload_canister_snapshot_data`) no longer accept a separate `canister_id: &Principal` parameter; the canister ID is now derived from the args struct.
+    * Migration: Remove the leading `&canister_id` argument from these calls.
+  * Removed `with_optional_*` builder methods from `CreateCanisterBuilder` and `UpdateSettingsBuilder` (`with_optional_controller`, `with_optional_compute_allocation`, `with_optional_memory_allocation`, `with_optional_freezing_threshold`, `with_optional_reserved_cycles_limit`, `with_optional_wasm_memory_limit`, `with_optional_wasm_memory_threshold`, `with_optional_log_visibility`, `with_optional_environment_variables`).
+    * Migration: Remove calls passing `None` (they were no-ops). For calls passing `Some(value)`, use the corresponding `with_*` method directly with the value.
+* Removed round-robin routing strategy. `DynamicRouteProvider` now exclusively uses latency-based routing.
+  * Removed `DynamicRoutingStrategy` enum and `RoundRobinRoutingSnapshot` type.
+  * `DynamicRouteProvider` is no longer generic over routing strategy.
+  * `DynamicRouteProviderBuilder::new()`, `::from_components()`, `::run_in_background()`, and `::run_in_background_with_intervals()` no longer accept `snapshot` or `strategy` parameters.
+  * Migration: Remove routing strategy arguments from your code - latency-based routing is now the only option.
+* `DynamicRouteProviderBuilder::build()` is no longer async. Background tasks are no longer started automatically during construction. Call `provider.start().await` for explicit initialization, or let it auto-start lazily on first `route()` call.
+* `DynamicRouteProvider::run()` is now private. Use `start()` instead.
+
+## [0.45.0] - 2025-12-19
+
+* Add `{get,fetch}_subnet_by_{id,canister}` functions to enable looking up subnet information.
+* Fix panic in web worker environments in `ic-agent`. 
+* Update `ic-management-canister-types` to 0.5.0
+
 ## [0.44.3] - 2025-10-31
 
 * Fix `Agent::wait_signed` to execute the read_state request on every retry iteration.

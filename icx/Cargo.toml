@@ -14,22 +14,19 @@ categories = ["command-line-interface", "web-programming::http-client"]
 keywords = ["internet-computer", "agent", "icp", "dfinity", "call"]
 include = ["src", "Cargo.toml", "../LICENSE", "README.md"]
 
-[lints]
-workspace = true
-
 [[bin]]
 name = "icx"
 path = "src/main.rs"
 
 [dependencies]
-anyhow = { version = "1.0", features = ["backtrace"] }
+anyhow = { workspace = true }
 candid = { workspace = true, features = ["value"] }
 candid_parser = { workspace = true }
-clap = { workspace = true, features = ["derive", "cargo", "color"] }
-ic-ed25519 = { workspace = true }
+clap = { workspace = true }
 hex = { workspace = true }
-humantime = "2.0.1"
+humantime = { workspace = true }
 ic-agent = { workspace = true, default-features = true }
+ic-ed25519 = { workspace = true }
 ic-utils = { workspace = true }
 pocket-ic = { workspace = true }
 serde = { workspace = true }

@@ -5,7 +5,7 @@ use std::{
 };
 
 use arc_swap::ArcSwap;
-use rand::Rng;
+use rand::RngExt;
 
 use crate::agent::route_provider::{
     dynamic_routing::{
@@ -225,7 +225,6 @@ impl LatencyRoutingSnapshot {
     }
 
     /// Sets whether to use only k nodes with the highest score for routing.
-    #[allow(unused)]
     pub fn set_k_top_nodes(mut self, k_top_nodes: usize) -> Self {
         self.k_top_nodes = Some(k_top_nodes);
         self
@@ -319,10 +318,10 @@ impl RoutingSnapshot for LatencyRoutingSnapshot {
         // Limit the number of returned nodes to the number of available nodes
         let n = std::cmp::min(n, routing_candidates.len());
         let mut nodes = Vec::with_capacity(n);
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
 
         for _ in 0..n {
-            let rand_num = rng.gen::<f64>();
+            let rand_num = rng.random::<f64>();
             if let Some(idx) = weighted_sample(routing_candidates.as_slice(), rand_num) {
                 let removed_node = routing_candidates.swap_remove(idx);
                 nodes.push(removed_node.node);
@@ -395,6 +394,7 @@ impl RoutingSnapshot for LatencyRoutingSnapshot {
 mod tests {
     use std::{
         collections::{HashMap, VecDeque},
+        slice,
         time::Duration,
     };
 
@@ -449,7 +449,7 @@ mod tests {
             .set_availability_penalty(false);
         let node = Node::new("api1.com").unwrap();
         let health = HealthCheckStatus::new(Some(Duration::from_secs(1)));
-        snapshot.sync_nodes(&[node.clone()]);
+        snapshot.sync_nodes(slice::from_ref(&node));
         assert_eq!(snapshot.routes_stats(), RoutesStats::new(1, Some(0)));
         // Check first update
         let is_updated = snapshot.update_node(&node, health);
@@ -489,12 +489,12 @@ mod tests {
         let mut snapshot = LatencyRoutingSnapshot::new();
         let node_1 = Node::new("api1.com").unwrap();
         // Sync with node_1
-        let nodes_changed = snapshot.sync_nodes(&[node_1.clone()]);
+        let nodes_changed = snapshot.sync_nodes(slice::from_ref(&node_1));
         assert!(nodes_changed);
         assert!(snapshot.existing_nodes.contains_key(&node_1));
         assert!(!snapshot.has_nodes());
         // Sync with node_1 again
-        let nodes_changed = snapshot.sync_nodes(&[node_1.clone()]);
+        let nodes_changed = snapshot.sync_nodes(slice::from_ref(&node_1));
         assert!(!nodes_changed);
         assert_eq!(
             snapshot.existing_nodes.keys().collect::<Vec<_>>(),
@@ -502,7 +502,7 @@ mod tests {
         );
         // Sync with node_2
         let node_2 = Node::new("api2.com").unwrap();
-        let nodes_changed = snapshot.sync_nodes(&[node_2.clone()]);
+        let nodes_changed = snapshot.sync_nodes(slice::from_ref(&node_2));
         assert!(nodes_changed);
         assert_eq!(
             snapshot.existing_nodes.keys().collect::<Vec<_>>(),
